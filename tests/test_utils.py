@@ -1,7 +1,3 @@
-import types
-
-import pytest
-
 import main
 
 

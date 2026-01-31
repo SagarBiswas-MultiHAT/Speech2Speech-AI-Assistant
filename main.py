@@ -8,14 +8,15 @@
 #     setx GROQ_API_KEY "your_key"      (Windows - persistent)
 #   python main.py
 
-import os
-import time
-import subprocess
-import webbrowser
 import logging
+import os
 import shutil
+import subprocess
+import time
+import webbrowser
 from dataclasses import dataclass
 from urllib.parse import quote
+
 import speech_recognition as sr
 import pyttsx3
 
