@@ -295,6 +295,24 @@ def prossesCommand(c: str, context=None):
             print("Play command error:", e)
             return context, False
 
+    if lcmd.startswith("search"):
+        # Support "search today's latest news" or "search: query"
+        try:
+            parts = command.split(" ", 1)
+            query = parts[1].strip() if len(parts) > 1 else ""
+            if not query and ":" in command:
+                query = command.split(":", 1)[1].strip()
+            if not query:
+                speak("Please say what you want me to search for.")
+                return context, False
+
+            speak(f"Searching for {query}")
+            _open_url("https://www.google.com/search?q=" + quote(query))
+            return context, False
+        except Exception as e:
+            print("Search command error:", e)
+            return context, False
+
     # Goodbye handling
     if _is_goodbye(command):
         output = "Goodbye! It was nice assisting you. Say 'hey sagar' when you need me."
@@ -384,6 +402,16 @@ def _normalize_text(text: str) -> str:
     text = " ".join([w.strip(".,!?;:") for w in text.split() if w.strip(".,!?;:")])
     return text
 
+EXIT_TERMS = {"exit", "quit", "stop", "close assistant"}
+
+def is_exit_command(text: str) -> bool:
+    if not text:
+        return False
+    text = text.lower().strip()
+    words = {w.strip(".,!?") for w in text.split()}
+    return any(term in words for term in EXIT_TERMS)
+
+
 def _fuzzy_match(text: str, target: str, threshold: float = 0.82) -> bool:
     """
     Fuzzy match two strings to tolerate minor recognition errors.
@@ -469,6 +497,13 @@ def main():
                 continue
 
             print("\nHeard (wakecheck):", word)
+
+            # GLOBAL EXIT (works even without wake word)
+            if isinstance(word, str) and is_exit_command(word):
+                speak("Goodbye. Shutting down.")
+                print("Exit command received. Stopping assistant.")
+                break
+
             if isinstance(word, str) and is_wake_word(word):
                 print("\nYes Boss! How can I assist you?")
                 speak("Yes boss. How can I assist you?")
