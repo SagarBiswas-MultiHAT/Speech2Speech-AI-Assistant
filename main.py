@@ -1,195 +1,497 @@
-# pip install pyaudio
-# pip install SpeechRecognition
-# pip install groq
-# pip install pyttsx3
+# main.py
+# Dependencies:
+#   pip install pyaudio SpeechRecognition groq pyttsx3
+#
+# Usage:
+#   set GROQ_API_KEY in your environment if you want Groq responses:
+#     export GROQ_API_KEY="your_key"    (Linux / macOS)
+#     setx GROQ_API_KEY "your_key"      (Windows - persistent)
+#   python main.py
 
-import speech_recognition as sr  # For capturing and recognizing speech
-import webbrowser  # For opening URLs in a web browser
-import pyttsx3  # For converting text to speech
-import contentLinks  # Custom module (assumed for handling content links like music or videos)
-from groq import Groq  # For interacting with the Groq API for AI responses
-import time  # For managing time-related functions like delays
+import os
+import time
+import subprocess
+import webbrowser
+from urllib.parse import quote
+import speech_recognition as sr
+import pyttsx3
 
-recognizer = sr.Recognizer()  # Initialize the speech recognizer for capturing and processing audio input
-engine = pyttsx3.init()  # Initialize the text-to-speech engine for converting text to spoken words
+# Optional imports (if present in your project)
+try:
+    import contentLinks  # custom module for mapping song names to links (optional)
+except Exception:
+    contentLinks = None
+
+# Groq (optional); we'll only use it if GROQ_API_KEY is set
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
+
+# ---------- Configuration ----------
+USE_POWERSHELL_TTS = os.name == "nt"
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+LISTEN_TIMEOUT = 20          # how long listen() waits for phrase to start
+PHRASE_TIME_LIMIT = 6        # maximum seconds per phrase
+WAKEWORD_TIMEOUT = 5         # timeout while waiting for wake word
+WAKEWORD_PHRASE_LIMIT = 2    # max seconds to capture wake-word phrase
+AMBIENT_ADJUST_DURATION = 0.8
+WAKEWORD_RECALIBRATE_EVERY = 5  # recalibrate ambient noise every N wake checks
+
+# ---------- TTS Setup ----------
+engine = None
+if not USE_POWERSHELL_TTS:
+    try:
+        engine = pyttsx3.init()
+        # try to set a voice safely
+        voices = engine.getProperty("voices")
+        if voices:
+            engine.setProperty("voice", voices[0].id)
+        engine.setProperty("volume", 1.0)
+    except Exception:
+        engine = None
 
 
-def speak(txt, rate=150): # ...................................... XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX (peak)_Function XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX ......................................
+def _escape_powershell_string(text: str) -> str:
+    return text.replace("'", "''")
+
+
+def _speak_powershell(txt: str, rate: int = 0) -> None:
+    safe_text = _escape_powershell_string(str(txt))
+    command = (
+        "Add-Type -AssemblyName System.Speech;"
+        "$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+        f"$speak.Rate = {rate};"
+        f"$speak.Speak('{safe_text}');"
+    )
+    # run PowerShell quietly
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def speak(txt: str, rate: int = 150) -> None:
     """
-    Convert text to speech and speak it out loud.
-    
-    Parameters:
-    txt (str): The text to be spoken.
-    rate (int): The speed of the speech (words per minute).
+    Convert text to speech. Uses PowerShell on Windows (reliable)
+    or pyttsx3 on other platforms if available.
     """
-    engine.setProperty('rate', rate) # Set the speech rate (words per minute)
-    engine.say(txt) # Queue(FIFO) the text to be spoken
-    engine.runAndWait() # Process and play the speech
+    if not txt:
+        return
+    if USE_POWERSHELL_TTS:
+        _speak_powershell(str(txt).strip(), rate)
+        return
 
-def listen_and_respond(duration=15, context=None): # ...................................... XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX (Listen and Respond)_Function XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX ...................................... 
+    if engine is None:
+        # If TTS engine missing, fallback: print message only
+        print("[TTS unavailable] ", txt)
+        return
 
+    try:
+        engine.setProperty("rate", rate)
+        engine.say(str(txt).strip())
+        engine.runAndWait()
+    except Exception as e:
+        print("TTS error:", e)
+
+
+# ---------- Utilities ----------
+GOODBYE_TERMS = {"good bye", "goodbye", "bye", "exit", "quit", "stop"}
+
+
+def _is_goodbye(text: str) -> bool:
     """
-    Listen for audio commands and respond to them within a specified duration.
-    
-    Parameters:
-    duration (int): The total time (in seconds) to keep listening and responding.
-    context (dict): The conversation context to maintain continuity in responses.
+    Returns True if the text contains any goodbye intent word.
+    Handles small punctuation and multi-word greetings.
     """
+    if not text:
+        return False
+    text = text.lower().strip()
+    if text in GOODBYE_TERMS:
+        return True
+    words = {w.strip(".,!?") for w in text.split() if w.strip(".,!?")}
+    return any(term in words for term in GOODBYE_TERMS)
 
-    start_time = time.time() # Record the start time
-    r = sr.Recognizer()  # Initialize the speech recognizer
 
-    while time.time() - start_time < duration:
-        remaining_time = duration - (time.time() - start_time) # Calculate remaining time
-        
-        if remaining_time <= 0:
-            break  # Exit the loop if the time is up
+# ---------- AI integration (optional) ----------
+_groq_client = None
+if Groq and GROQ_API_KEY:
+    try:
+        _groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception:
+        _groq_client = None
+else:
+    _groq_client = None
 
-        try:
-            with sr.Microphone() as source:
-                print("\n--> Sagar listening...") # Notify that the bot is listening
-                audio = r.listen(source, timeout=20, phrase_time_limit=5) # Listen for audio with a timeout and phrase time limit
-                command = r.recognize_google(audio) # Convert audio to text
-                print("\nCommand:", command) # Print the recognized command
 
-                context = prossesCommand(command, context) # Process the command and update context
-                start_time = time.time()  # Reset the start time to keep listening for another 15 seconds
-
-        except sr.WaitTimeoutError:
-            print("\nListening timed out while waiting for phrase to start.") # Handle timeout error
-
-        except sr.RequestError as e:
-            print(f"\nCould not request results from Google Speech Recognition service; {e}") # Handle request error
-
-def aiProcess(command, context=None): # ...................................... XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX (Ai Process)_Function XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX ...................................... 
-
+def aiProcess(command: str, context=None) -> str:
     """
-    Generate a response to a command using the Groq API, incorporating conversation context.
-
-    Parameters:
-    command (str): The user's input command that needs to be processed.
-    context (list of dict): The conversation history to provide context for generating a response.
-
-    Returns:
-    str: The generated response from the Groq API.
+    Generate a response using Groq API if available.
+    If not available, returns a simple fallback string.
     """
+    if not command:
+        return "I didn't hear anything."
 
-    client = Groq(api_key="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") # Initialize the Groq API client with the provided API key
+    if _groq_client is None:
+        # graceful fallback when no API access
+        # Keep replies short and assistant-like (good for voice)
+        return f"Sorry, AI access is not configured. You said: {command}"
 
- # Create a list of messages to send to the Groq API
+    # Build messages
     messages = [
-        {"role": "system", "content": "You are a virtual assistant named Sagar Biswas. You are skilled in general tasks like Alexa and Google Cloud. Generate texts that are appropriate for voice assistant. Must try to give short responses with perfect and understandable results."},
+        {
+            "role": "system",
+            "content": (
+                "You are a concise voice assistant named Sagar Biswas. "
+                "Give short, clear replies suitable for speech output."
+            ),
+        }
     ]
-
-    # Include previous context if available to maintain conversation continuity
     if context:
         messages.extend(context)
 
-    # Append the user's command to the messages list
     messages.append({"role": "user", "content": command})
 
-     # Send the chat completion request to the Groq API and receive the response
-    completion = client.chat.completions.create(
-        model="llama3-70b-8192",
-        messages=messages
-    )
+    try:
+        completion = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+        )
+        # The Groq SDK returns choices; robustly access them
+        choice = getattr(completion, "choices", None)
+        if choice and len(choice) > 0:
+            # support differing structures defensively
+            msg = choice[0].message.content if hasattr(choice[0], "message") else choice[0].get("message", {}).get("content", "")
+            if not msg:
+                # fallback to raw text if present
+                msg = getattr(choice[0], "text", "") or str(choice[0])
+            return str(msg)
+        # fallback
+        return str(completion)
+    except Exception as e:
+        print("Error calling Groq API:", e)
+        return f"Sorry, I couldn't reach the AI service. You said: {command}"
 
-    return completion.choices[0].message.content # Return the content of the generated response # why choices[0]? for the first message content? --> YES.
 
-def prossesCommand(c, context=None): # ...................................... XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX (Prosses Command)_Function XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX ...................................... 
+# ---------- Command processing ----------
+def _open_url(url: str) -> None:
+    """Helper to open a URL in a new browser tab; ensures scheme exists."""
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        webbrowser.open_new_tab(url)
+    except Exception as e:
+        print("Could not open browser:", e)
 
+def open_vscode():
     """
-    Process a user command and perform actions based on the command. 
-    Update the conversation context with each interaction.
-
-    Parameters:
-    c (str): The command input from the user.
-    context (list of dict): The conversation history to maintain continuity.
-
-    Returns:
-    list of dict: Updated conversation context including the latest interaction.
+    Open Visual Studio Code using an absolute path (Windows).
     """
-    # Check if the command is to open a specific website
-    if c.lower() == "open google": webbrowser.open("www.google.com")
-    elif c.lower() == "open facebook": webbrowser.open("www.facebook.com")
-    elif c.lower() == "open youtube": webbrowser.open("www.youtube.com")
-    elif c.lower() == "open github": webbrowser.open("www.github.com")
-    elif c.lower() == "open stack overflow": webbrowser.open("www.stackoverflow.com")
-    elif c.lower() == "open linkedin": webbrowser.open("www.linkedin.com")
-    elif c.lower().startswith("play"):
+    vscode_path = r"C:\Users\sagar\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+
+    if not os.path.exists(vscode_path):
+        speak("Visual Studio Code is not installed in the expected location.")
+        return
+
+    try:
+        subprocess.Popen([vscode_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("Error opening VS Code:", e)
+        speak("Sorry, I couldn't open Visual Studio Code.")
+
+def close_vscode():
+    """
+    Close all running Visual Studio Code windows (Windows).
+    """
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "Code.exe"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False
+        )
+        speak("Visual Studio Code closed.")
+    except Exception as e:
+        print("Error closing VS Code:", e)
+        speak("Sorry, I couldn't close Visual Studio Code.")
+
+
+
+def prossesCommand(c: str, context=None):
+    """
+    Process a single spoken command.
+    Returns (context, exit_to_wake) where exit_to_wake=True means user said goodbye.
+    """
+    if not c:
+        return context, False
+
+    command = c.strip()
+    lcmd = command.lower()
+
+    if lcmd in {"open vscode", "open vs code", "open visual studio code"}:
+        open_vscode()
+        speak("Opening Visual Studio Code.")
+        return context, False
+
+    if lcmd in {"close vscode", "close vs code", "close visual studio code"}:
+        close_vscode()
+        return context, False
+
+
+    # Quick built-ins (exact matches are checked first for speed)
+    if lcmd == "open google":
+        _open_url("www.google.com")
+        return context, False
+    if lcmd == "open facebook":
+        _open_url("www.facebook.com")
+        return context, False
+    if lcmd == "open youtube":
+        _open_url("www.youtube.com")
+        return context, False
+    if lcmd == "open github":
+        _open_url("www.github.com")
+        return context, False
+    if lcmd == "open stack overflow" or lcmd == "open stackoverflow":
+        _open_url("www.stackoverflow.com")
+        return context, False
+    if lcmd == "open linkedin":
+        _open_url("www.linkedin.com")
+        return context, False
+
+    if lcmd.startswith("play"):
+        # Support "play bohemian rhapsody" or "play: song name"
+        # Use maxsplit=1 to keep the full song name
         try:
-            words = c.lower().split(" ") # Extracting the song name from the command
-            if len(words) > 1:
-                song = words[1] # Get the song name
-                link = contentLinks.Links.get(song, None) # Retrieve the link from the contentLinks module
-                """
-                The None here is used as the default value for the get method.
-                Explanation:
-                contentLinks.Links: This is likely a dictionary or a dictionary-like object.
-                .get(song, None): The get method is used to retrieve the value associated with the key song.
-                Why use None?
-                Default Value: If the key song is not found in the dictionary Links, the get method returns None instead of raising a KeyError. This makes the code safer and avoids potential errors when accessing keys that might not exist.
-                """
-                if link:
-                    webbrowser.open(link) # Open the song link in the browser
-                else:
-                    print("\n ..:: Song not found in the music library.") # Handle case where song is not found
+            parts = command.split(" ", 1)
+            song = parts[1].strip() if len(parts) > 1 else ""
+            if not song and ":" in command:
+                # fallback if user said "play: song"
+                song = command.split(":", 1)[1].strip()
+            if not song:
+                speak("Please say the song name after 'play'.")
+                return context, False
+
+            # Try contentLinks if available (must be a mapping)
+            link = None
+            if contentLinks and hasattr(contentLinks, "Links"):
+                try:
+                    link = contentLinks.Links.get(song.lower())
+                except Exception:
+                    link = None
+
+            if link:
+                _open_url(link)
+                speak(f"Playing {song}")
             else:
-                print("\n..:: No song specified.") # Handle case where no song is specified
+                speak(f"I don't have {song} in the library. Opening a web search.")
+                _open_url("https://www.youtube.com/results?search_query=" + quote(song))
+            return context, False
         except Exception as e:
-            print(f"Error: {e}") # Handle any exceptions that occur
-    else:
-        # Process the command using the AI process function and get a response
-        output = aiProcess(c, context)
-        print("\nAI Response:", output) # Print the AI response
-        speak(output) # Convert the response to speech and speak it out
+            print("Play command error:", e)
+            return context, False
 
-        # Update context with the latest interaction
+    # Goodbye handling
+    if _is_goodbye(command):
+        output = "Goodbye! It was nice assisting you. Say 'hey sagar' when you need me."
+        print("\nAI Response:", output)
+        speak(output)
         if context is None:
-            context = [] # Initialize context if it is not provided
-
-         # Append the user's command and the AI's response to the context
-        context.append({"role": "user", "content": c})
+            context = []
+        context.append({"role": "user", "content": command})
         context.append({"role": "assistant", "content": output})
+        return context, True
 
-    return context  # Return the updated context
+    # Otherwise, fallback to AI processing (or fallback string)
+    output = aiProcess(command, context)
+    print("\nAI Response:", output)
+    speak(output)
+
+    if context is None:
+        context = []
+
+    context.append({"role": "user", "content": command})
+    context.append({"role": "assistant", "content": output})
+
+    return context, False
 
 
-if __name__ == "__main__": # if __name__ == "__main__": checks if the script is being run directly, not imported. (Not a function, but a statement)...............................................................................................................................
-
+# ---------- Listening loop (active mode) ----------
+def listen_and_respond(context=None):
     """
-    Main entry point of the program. Continuously listen for commands, process them,
-    and respond based on the context and user inputs.
+    Active listening mode. Keeps listening and responding until the user says goodbye.
+    Returns True only when user said goodbye (so main loop can go back to wake-word).
     """
-    context = None  # Initialize the conversation context to manage continuity
+    recognizer = sr.Recognizer()
 
     while True:
-        print("Recognizing...") # Indicate that the bot is starting to recognize speech
         try:
-            r = sr.Recognizer() # Initialize the speech recognizer
             with sr.Microphone() as source:
-                print("Listening...") # Indicate that the bot is listening for the activation word
-                audio = r.listen(source, timeout=5, phrase_time_limit=2) # Listen for audio with a 5-second timeout and 2-second phrase limit
+                recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                print("\n--> Sagar listening...")
+                audio = recognizer.listen(source, timeout=LISTEN_TIMEOUT, phrase_time_limit=PHRASE_TIME_LIMIT)
+                try:
+                    command = recognizer.recognize_google(audio)
+                except sr.UnknownValueError:
+                    # Could not parse audio
+                    print("\nSorry, I didn't catch that.")
+                    continue
+                except sr.RequestError as e:
+                    # API/service error (network or service)
+                    print("\nSpeech recognition service error:", e)
+                    speak("Speech service error. Please check your internet connection.")
+                    continue
 
-            word = r.recognize_google(audio)  # Convert the audio to text
+                print("\nCommand:", command)
+                context, exit_to_wake = prossesCommand(command, context)
+                if exit_to_wake:
+                    # user said goodbye; return to wake-word mode
+                    return True
 
-            # Check if the recognized word is the activation word
-            if word.lower() == "hey sagar":
-                print("\nYes Boss! How Can I Assist You?") # Notify that the bot is now listening for commands
-                speak("\nYes Boss! How Can I Assist You?")  # Respond to the activation word
-
-                with sr.Microphone() as source:
-
-                    print("\n--> Sagar listening...") # Notify that the bot is listening
-                    audio = r.listen(source, timeout=20, phrase_time_limit=5)  # Capture audio for the command
-                    command = r.recognize_google(audio) # Convert the command audio to text
-                    print("\nCommand:", command) # Print the recognized command
-
-                    # Process the command and update the context
-                    context = prossesCommand(command, context) # Pass the context to maintain continuity
-
-                    # Continue listening and responding based on the updated context
-                    listen_and_respond(context=context) # Keep listening and responding for a specified duration
-
+        except sr.WaitTimeoutError:
+            # Nothing said; go back to listening in active mode
+            print("\nListening timed out (no speech detected).")
+            continue
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received. Exiting.")
+            speak("Goodbye.")
+            raise
         except Exception as e:
-            print(f"Timeout! {e} \n") # Print any errors that occur during execution
+            print("Unexpected error in active listening:", e)
+            # keep the assistant alive; don't drop to wake-word mode unexpectedly
+            continue
+
+
+WAKE_WORDS = {
+    "hey sagar",
+    "sagar",
+    "multihat",
+    "hello",
+}
+
+def _normalize_text(text: str) -> str:
+    """
+    Normalize text for wake-word matching.
+    """
+    if not text:
+        return ""
+    text = text.lower().strip()
+    # remove simple punctuation and extra spaces
+    text = " ".join([w.strip(".,!?;:") for w in text.split() if w.strip(".,!?;:")])
+    return text
+
+def _fuzzy_match(text: str, target: str, threshold: float = 0.82) -> bool:
+    """
+    Fuzzy match two strings to tolerate minor recognition errors.
+    """
+    if not text or not target:
+        return False
+    try:
+        from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, text, target).ratio()
+        return ratio >= threshold
+    except Exception:
+        return False
+
+def is_wake_word(text: str) -> bool:
+    """
+    Check if recognized speech matches any supported wake word.
+    Allows extra words and minor recognition errors.
+    """
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+
+    # direct match
+    if norm in WAKE_WORDS:
+        return True
+
+    # contained phrase match (e.g., "hey sagar please")
+    for wake in WAKE_WORDS:
+        if wake in norm:
+            return True
+
+    # fuzzy match as fallback
+    for wake in WAKE_WORDS:
+        if _fuzzy_match(norm, wake):
+            return True
+
+    return False
+
+
+# ---------- Main (wake-word) loop ----------
+def main():
+    context = None
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
+    recognizer.pause_threshold = 0.6
+    recognizer.non_speaking_duration = 0.3
+    wake_checks = 0
+
+    print("\nSagar voice assistant starting. Say 'hey sagar' to activate.")
+    speak("Sagar voice assistant starting. Say 'hey sagar' to activate.")
+
+    # Initial ambient calibration to reduce false negatives
+    try:
+        with sr.Microphone() as source:
+            print("Calibrating microphone...")
+            recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+    except Exception as e:
+        print("Microphone calibration error:", e)
+
+    while True:
+        print("\nRecognizing...")
+        try:
+            with sr.Microphone() as source:
+                print("Listening...")
+                # Recalibrate occasionally to adapt to noise without slowing each loop
+                if WAKEWORD_RECALIBRATE_EVERY and (wake_checks % WAKEWORD_RECALIBRATE_EVERY == 0):
+                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                audio = recognizer.listen(
+                    source,
+                    timeout=WAKEWORD_TIMEOUT,
+                    phrase_time_limit=WAKEWORD_PHRASE_LIMIT
+                )
+                wake_checks += 1
+
+            try:
+                word = recognizer.recognize_google(audio)
+            except sr.UnknownValueError:
+                print("Didn't catch that.")
+                continue
+            except sr.RequestError as e:
+                print("Speech service error while listening for wake word:", e)
+                time.sleep(0.5)
+                continue
+
+            print("\nHeard (wakecheck):", word)
+            if isinstance(word, str) and is_wake_word(word):
+                print("\nYes Boss! How can I assist you?")
+                speak("Yes boss. How can I assist you?")
+                # Enter active mode; when it returns, we go back to wake-word mode
+                try:
+                    listen_and_respond(context=context)
+                except KeyboardInterrupt:
+                    print("Exiting on keyboard interrupt.")
+                    break
+                # when listen_and_respond returns, we continue loop and begin wake-word detection again
+
+        except sr.WaitTimeoutError:
+            print("\nTimeout! (no wake word detected)\n")
+            continue
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received. Stopping assistant.")
+            speak("Goodbye.")
+            break
+        except Exception as e:
+            print("\nError in main loop:\n", e)
+            time.sleep(0.5)
+            continue
+
+
+if __name__ == "__main__":
+    main()
