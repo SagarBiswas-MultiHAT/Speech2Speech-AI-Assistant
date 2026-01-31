@@ -32,12 +32,13 @@ except Exception:
 USE_POWERSHELL_TTS = os.name == "nt"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-LISTEN_TIMEOUT = 20          # how long listen() waits for phrase to start
-PHRASE_TIME_LIMIT = 6        # maximum seconds per phrase
-WAKEWORD_TIMEOUT = 5         # timeout while waiting for wake word
-WAKEWORD_PHRASE_LIMIT = 2    # max seconds to capture wake-word phrase
-AMBIENT_ADJUST_DURATION = 0.8
-WAKEWORD_RECALIBRATE_EVERY = 5  # recalibrate ambient noise every N wake checks
+LISTEN_TIMEOUT = 25          # how long listen() waits for phrase to start
+PHRASE_TIME_LIMIT = 8        # maximum seconds per phrase
+WAKEWORD_TIMEOUT = 4         # timeout while waiting for wake word
+WAKEWORD_PHRASE_LIMIT = 1.8  # max seconds to capture wake-word phrase
+AMBIENT_ADJUST_DURATION = 0.4
+WAKEWORD_RECALIBRATE_EVERY = 0  # 0 disables periodic recalibration
+FAILURE_RECALIBRATE_AFTER = 2   # recalibrate after consecutive failures
 
 # ---------- TTS Setup ----------
 engine = None
@@ -96,6 +97,27 @@ def speak(txt: str, rate: int = 150) -> None:
         engine.runAndWait()
     except Exception as e:
         print("TTS error:", e)
+
+
+def _configure_recognizer(recognizer: sr.Recognizer, mode: str = "wake") -> None:
+    """
+    Configure recognizer settings for more reliable listening.
+    """
+    recognizer.dynamic_energy_threshold = True
+    # Wake word needs faster endpointing; active mode can be slightly more patient
+    if mode == "wake":
+        recognizer.pause_threshold = 0.5
+        recognizer.non_speaking_duration = 0.2
+        recognizer.phrase_threshold = 0.2
+        recognizer.dynamic_energy_adjustment_damping = 0.12
+        recognizer.dynamic_energy_ratio = 1.4
+    else:
+        # Be more patient in active mode to avoid cutting users off mid-sentence
+        recognizer.pause_threshold = 1.0
+        recognizer.non_speaking_duration = 0.4
+        recognizer.phrase_threshold = 0.4
+        recognizer.dynamic_energy_adjustment_damping = 0.15
+        recognizer.dynamic_energy_ratio = 1.6
 
 
 # ---------- Utilities ----------
@@ -187,6 +209,23 @@ def _open_url(url: str) -> None:
         webbrowser.open_new_tab(url)
     except Exception as e:
         print("Could not open browser:", e)
+
+
+def _recognize_google_any(recognizer: sr.Recognizer, audio) -> list:
+    """
+    Return a list of possible transcripts from Google Speech.
+    """
+    try:
+        result = recognizer.recognize_google(audio, show_all=True)
+    except Exception:
+        return []
+
+    if isinstance(result, str):
+        return [result]
+    if isinstance(result, dict):
+        alts = result.get("alternative") or []
+        return [a.get("transcript", "") for a in alts if a.get("transcript")]
+    return []
 
 def open_vscode():
     """
@@ -345,11 +384,17 @@ def listen_and_respond(context=None):
     Returns True only when user said goodbye (so main loop can go back to wake-word).
     """
     recognizer = sr.Recognizer()
+    _configure_recognizer(recognizer, mode="active")
+    mic = sr.Microphone()
+    failures = 0
 
     while True:
         try:
-            with sr.Microphone() as source:
-                recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+            with mic as source:
+                # Recalibrate only after several consecutive failures
+                if failures >= FAILURE_RECALIBRATE_AFTER:
+                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                    failures = 0
                 print("\n--> Sagar listening...")
                 audio = recognizer.listen(source, timeout=LISTEN_TIMEOUT, phrase_time_limit=PHRASE_TIME_LIMIT)
                 try:
@@ -357,6 +402,7 @@ def listen_and_respond(context=None):
                 except sr.UnknownValueError:
                     # Could not parse audio
                     print("\nSorry, I didn't catch that.")
+                    failures += 1
                     continue
                 except sr.RequestError as e:
                     # API/service error (network or service)
@@ -364,6 +410,7 @@ def listen_and_respond(context=None):
                     speak("Speech service error. Please check your internet connection.")
                     continue
 
+                failures = 0
                 print("\nCommand:", command)
                 context, exit_to_wake = prossesCommand(command, context)
                 if exit_to_wake:
@@ -375,8 +422,8 @@ def listen_and_respond(context=None):
             print("\nListening timed out (no speech detected).")
             continue
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received. Exiting.")
-            speak("Goodbye.")
+            print("\nKeyboard interrupt received. Exiting.\n")
+            speak("Goodbye.\n")
             raise
         except Exception as e:
             print("Unexpected error in active listening:", e)
@@ -385,6 +432,7 @@ def listen_and_respond(context=None):
 
 
 WAKE_WORDS = {
+    "hey",
     "hey sagar",
     "sagar",
     "multihat",
@@ -455,10 +503,10 @@ def is_wake_word(text: str) -> bool:
 def main():
     context = None
     recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.6
-    recognizer.non_speaking_duration = 0.3
+    _configure_recognizer(recognizer, mode="wake")
     wake_checks = 0
+    wake_failures = 0
+    mic = sr.Microphone()
 
     print("\nSagar voice assistant starting. Say 'hey sagar' to activate.")
     speak("Sagar voice assistant starting. Say 'hey sagar' to activate.")
@@ -474,11 +522,14 @@ def main():
     while True:
         print("\nRecognizing...")
         try:
-            with sr.Microphone() as source:
+            with mic as source:
                 print("Listening...")
-                # Recalibrate occasionally to adapt to noise without slowing each loop
+                # Recalibrate occasionally or after consecutive failures
                 if WAKEWORD_RECALIBRATE_EVERY and (wake_checks % WAKEWORD_RECALIBRATE_EVERY == 0):
                     recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                if wake_failures >= FAILURE_RECALIBRATE_AFTER:
+                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                    wake_failures = 0
                 audio = recognizer.listen(
                     source,
                     timeout=WAKEWORD_TIMEOUT,
@@ -486,32 +537,30 @@ def main():
                 )
                 wake_checks += 1
 
-            try:
-                word = recognizer.recognize_google(audio)
-            except sr.UnknownValueError:
+            alternatives = _recognize_google_any(recognizer, audio)
+            if not alternatives:
                 print("Didn't catch that.")
-                continue
-            except sr.RequestError as e:
-                print("Speech service error while listening for wake word:", e)
-                time.sleep(0.5)
+                wake_failures += 1
                 continue
 
-            print("\nHeard (wakecheck):", word)
+            wake_failures = 0
+            heard = alternatives[0]
+            print("\nHeard (wakecheck):", heard)
 
             # GLOBAL EXIT (works even without wake word)
-            if isinstance(word, str) and is_exit_command(word):
+            if any(is_exit_command(alt) for alt in alternatives):
                 speak("Goodbye. Shutting down.")
-                print("Exit command received. Stopping assistant.")
+                print("Exit command received. Stopping assistant.\n")
                 break
 
-            if isinstance(word, str) and is_wake_word(word):
+            if any(is_wake_word(alt) for alt in alternatives):
                 print("\nYes Boss! How can I assist you?")
                 speak("Yes boss. How can I assist you?")
                 # Enter active mode; when it returns, we go back to wake-word mode
                 try:
                     listen_and_respond(context=context)
                 except KeyboardInterrupt:
-                    print("Exiting on keyboard interrupt.")
+                    print("Exiting on keyboard interrupt.\n\n")
                     break
                 # when listen_and_respond returns, we continue loop and begin wake-word detection again
 
@@ -519,8 +568,8 @@ def main():
             print("\nTimeout! (no wake word detected)\n")
             continue
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received. Stopping assistant.")
-            speak("Goodbye.")
+            print("\nKeyboard interrupt received. Stopping assistant.\n")
+            speak("Goodbye.\n")
             break
         except Exception as e:
             print("\nError in main loop:\n", e)
