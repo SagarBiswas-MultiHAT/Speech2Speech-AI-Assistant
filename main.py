@@ -12,6 +12,9 @@ import os
 import time
 import subprocess
 import webbrowser
+import logging
+import shutil
+from dataclasses import dataclass
 from urllib.parse import quote
 import speech_recognition as sr
 import pyttsx3
@@ -29,20 +32,58 @@ except Exception:
     Groq = None
 
 # ---------- Configuration ----------
-USE_POWERSHELL_TTS = os.name == "nt"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-LISTEN_TIMEOUT = 25          # how long listen() waits for phrase to start
-PHRASE_TIME_LIMIT = 8        # maximum seconds per phrase
-WAKEWORD_TIMEOUT = 4         # timeout while waiting for wake word
-WAKEWORD_PHRASE_LIMIT = 1.8  # max seconds to capture wake-word phrase
-AMBIENT_ADJUST_DURATION = 0.4
-WAKEWORD_RECALIBRATE_EVERY = 0  # 0 disables periodic recalibration
-FAILURE_RECALIBRATE_AFTER = 2   # recalibrate after consecutive failures
+@dataclass(frozen=True)
+class Config:
+    use_powershell_tts: bool
+    groq_api_key: str
+    groq_model: str
+    listen_timeout: int
+    phrase_time_limit: int
+    wakeword_timeout: int
+    wakeword_phrase_limit: float
+    wakeword_energy_threshold: int
+    ambient_adjust_duration: float
+    wakeword_recalibrate_every: int
+    wakeword_failure_recalibrate_after: int
+    failure_recalibrate_after: int
+    vscode_path: str | None
+    min_command_words: int
+    followup_timeout: int
+    followup_phrase_limit: int
+
+    @staticmethod
+    def from_env() -> "Config":
+        return Config(
+            use_powershell_tts=os.name == "nt",
+            groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
+            groq_model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+            listen_timeout=int(os.getenv("LISTEN_TIMEOUT", "25")),
+            phrase_time_limit=int(os.getenv("PHRASE_TIME_LIMIT", "20")),
+            wakeword_timeout=int(os.getenv("WAKEWORD_TIMEOUT", "8")),
+            wakeword_phrase_limit=float(os.getenv("WAKEWORD_PHRASE_LIMIT", "4.0")),
+            wakeword_energy_threshold=int(os.getenv("WAKEWORD_ENERGY_THRESHOLD", "250")),
+            ambient_adjust_duration=float(os.getenv("AMBIENT_ADJUST_DURATION", "0.4")),
+            wakeword_recalibrate_every=int(os.getenv("WAKEWORD_RECALIBRATE_EVERY", "0")),
+            wakeword_failure_recalibrate_after=int(os.getenv("WAKEWORD_FAILURE_RECALIBRATE_AFTER", "1")),
+            failure_recalibrate_after=int(os.getenv("FAILURE_RECALIBRATE_AFTER", "2")),
+            vscode_path=os.getenv("VSCODE_PATH"),
+            min_command_words=int(os.getenv("MIN_COMMAND_WORDS", "4")),
+            followup_timeout=int(os.getenv("FOLLOWUP_TIMEOUT", "8")),
+            followup_phrase_limit=int(os.getenv("FOLLOWUP_PHRASE_LIMIT", "12")),
+        )
+
+
+CONFIG = Config.from_env()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("assistant")
 
 # ---------- TTS Setup ----------
 engine = None
-if not USE_POWERSHELL_TTS:
+if not CONFIG.use_powershell_tts:
     try:
         engine = pyttsx3.init()
         # try to set a voice safely
@@ -82,7 +123,7 @@ def speak(txt: str, rate: int = 150) -> None:
     """
     if not txt:
         return
-    if USE_POWERSHELL_TTS:
+    if CONFIG.use_powershell_tts:
         _speak_powershell(str(txt).strip(), rate)
         return
 
@@ -106,22 +147,25 @@ def _configure_recognizer(recognizer: sr.Recognizer, mode: str = "wake") -> None
     recognizer.dynamic_energy_threshold = True
     # Wake word needs faster endpointing; active mode can be slightly more patient
     if mode == "wake":
-        recognizer.pause_threshold = 0.5
-        recognizer.non_speaking_duration = 0.2
-        recognizer.phrase_threshold = 0.2
-        recognizer.dynamic_energy_adjustment_damping = 0.12
-        recognizer.dynamic_energy_ratio = 1.4
+        recognizer.pause_threshold = 0.9
+        recognizer.non_speaking_duration = 0.25
+        recognizer.phrase_threshold = 0.3
+        recognizer.energy_threshold = CONFIG.wakeword_energy_threshold
+        recognizer.dynamic_energy_adjustment_damping = 0.2
+        recognizer.dynamic_energy_ratio = 1.2
     else:
         # Be more patient in active mode to avoid cutting users off mid-sentence
-        recognizer.pause_threshold = 1.0
-        recognizer.non_speaking_duration = 0.4
-        recognizer.phrase_threshold = 0.4
+        recognizer.pause_threshold = 2.2
+        recognizer.non_speaking_duration = 0.8
+        recognizer.phrase_threshold = 0.6
         recognizer.dynamic_energy_adjustment_damping = 0.15
         recognizer.dynamic_energy_ratio = 1.6
 
 
 # ---------- Utilities ----------
 GOODBYE_TERMS = {"good bye", "goodbye", "bye", "exit", "quit", "stop"}
+
+LAST_PROVIDED_URL = None
 
 
 def _is_goodbye(text: str) -> bool:
@@ -138,11 +182,28 @@ def _is_goodbye(text: str) -> bool:
     return any(term in words for term in GOODBYE_TERMS)
 
 
+def _extract_first_url(text: str) -> str | None:
+    if not text:
+        return None
+    try:
+        import re
+
+        match = re.search(r"(https?://[^\s]+)", text)
+        if match:
+            return match.group(1).rstrip(".,)")
+        match = re.search(r"(www\.[^\s]+)", text)
+        if match:
+            return "https://" + match.group(1).rstrip(".,)")
+    except Exception:
+        return None
+    return None
+
+
 # ---------- AI integration (optional) ----------
 _groq_client = None
-if Groq and GROQ_API_KEY:
+if Groq and CONFIG.groq_api_key:
     try:
-        _groq_client = Groq(api_key=GROQ_API_KEY)
+        _groq_client = Groq(api_key=CONFIG.groq_api_key)
     except Exception:
         _groq_client = None
 else:
@@ -179,7 +240,7 @@ def aiProcess(command: str, context=None) -> str:
 
     try:
         completion = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=CONFIG.groq_model,
             messages=messages,
         )
         # The Groq SDK returns choices; robustly access them
@@ -205,10 +266,12 @@ def _open_url(url: str) -> None:
         return
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+    global LAST_PROVIDED_URL
+    LAST_PROVIDED_URL = url
     try:
         webbrowser.open_new_tab(url)
     except Exception as e:
-        print("Could not open browser:", e)
+        logger.error("Could not open browser: %s", e)
 
 
 def _recognize_google_any(recognizer: sr.Recognizer, audio) -> list:
@@ -217,6 +280,8 @@ def _recognize_google_any(recognizer: sr.Recognizer, audio) -> list:
     """
     try:
         result = recognizer.recognize_google(audio, show_all=True)
+    except sr.RequestError:
+        raise
     except Exception:
         return []
 
@@ -227,20 +292,73 @@ def _recognize_google_any(recognizer: sr.Recognizer, audio) -> list:
         return [a.get("transcript", "") for a in alts if a.get("transcript")]
     return []
 
+
+def _strip_leading_fillers(text: str) -> str:
+    if not text:
+        return ""
+    words = text.strip().split()
+    fillers = {"for", "the", "a", "an", "to", "please", "your", "this", "that"}
+    while words and words[0].lower() in fillers:
+        words.pop(0)
+    return " ".join(words)
+
+
+def _is_link_reference(text: str) -> bool:
+    if not text:
+        return False
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    phrases = {
+        "provided link",
+        "your provided link",
+        "the provided link",
+        "that link",
+        "the link",
+        "this link",
+        "provided url",
+        "your provided url",
+        "the provided url",
+        "that url",
+        "the url",
+        "this url",
+        "link",
+        "url",
+    }
+    if any(p in norm for p in phrases):
+        return True
+    words = norm.split()
+    if "link" in words or "url" in words:
+        return len(words) <= 3
+    return False
+
+def _resolve_vscode_path() -> str | None:
+    if CONFIG.vscode_path and os.path.exists(CONFIG.vscode_path):
+        return CONFIG.vscode_path
+    code_path = shutil.which("code")
+    if code_path:
+        return code_path
+    default_path = r"C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+    expanded = os.path.expandvars(default_path)
+    if os.path.exists(expanded):
+        return expanded
+    return None
+
+
 def open_vscode():
     """
     Open Visual Studio Code using an absolute path (Windows).
     """
-    vscode_path = r"C:\Users\sagar\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+    vscode_path = _resolve_vscode_path()
 
-    if not os.path.exists(vscode_path):
+    if not vscode_path:
         speak("Visual Studio Code is not installed in the expected location.")
         return
 
     try:
         subprocess.Popen([vscode_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        print("Error opening VS Code:", e)
+        logger.error("Error opening VS Code: %s", e)
         speak("Sorry, I couldn't open Visual Studio Code.")
 
 def close_vscode():
@@ -256,7 +374,7 @@ def close_vscode():
         )
         speak("Visual Studio Code closed.")
     except Exception as e:
-        print("Error closing VS Code:", e)
+        logger.error("Error closing VS Code: %s", e)
         speak("Sorry, I couldn't close Visual Studio Code.")
 
 
@@ -266,6 +384,9 @@ def prossesCommand(c: str, context=None):
     Process a single spoken command.
     Returns (context, exit_to_wake) where exit_to_wake=True means user said goodbye.
     """
+
+    global LAST_PROVIDED_URL   # ✅ MUST be first
+
     if not c:
         return context, False
 
@@ -280,7 +401,6 @@ def prossesCommand(c: str, context=None):
     if lcmd in {"close vscode", "close vs code", "close visual studio code"}:
         close_vscode()
         return context, False
-
 
     # Quick built-ins (exact matches are checked first for speed)
     if lcmd == "open google":
@@ -315,6 +435,22 @@ def prossesCommand(c: str, context=None):
                 speak("Please say the song name after 'play'.")
                 return context, False
 
+            song = _strip_leading_fillers(song)
+            song_norm = _normalize_text(song)
+
+            if _is_link_reference(song_norm):
+                if LAST_PROVIDED_URL:
+                    _open_url(LAST_PROVIDED_URL)
+                    speak("Playing the provided link.")
+                else:
+                    speak("I don't have a provided link yet.")
+                return context, False
+
+            if song.startswith(("http://", "https://", "www.")):
+                _open_url(song)
+                speak("Playing the link.")
+                return context, False
+
             # Try contentLinks if available (must be a mapping)
             link = None
             if contentLinks and hasattr(contentLinks, "Links"):
@@ -327,11 +463,12 @@ def prossesCommand(c: str, context=None):
                 _open_url(link)
                 speak(f"Playing {song}")
             else:
+                print(f"I don't have {song} in the library. Opening a web search.")
                 speak(f"I don't have {song} in the library. Opening a web search.")
                 _open_url("https://www.youtube.com/results?search_query=" + quote(song))
             return context, False
         except Exception as e:
-            print("Play command error:", e)
+            logger.error("Play command error: %s", e)
             return context, False
 
     if lcmd.startswith("search"):
@@ -349,13 +486,14 @@ def prossesCommand(c: str, context=None):
             _open_url("https://www.google.com/search?q=" + quote(query))
             return context, False
         except Exception as e:
-            print("Search command error:", e)
+            logger.error("Search command error: %s", e)
             return context, False
 
     # Goodbye handling
     if _is_goodbye(command):
+        print("\n")
         output = "Goodbye! It was nice assisting you. Say 'hey sagar' when you need me."
-        print("\nAI Response:", output)
+        logger.info("AI Response: %s", output)
         speak(output)
         if context is None:
             context = []
@@ -364,9 +502,13 @@ def prossesCommand(c: str, context=None):
         return context, True
 
     # Otherwise, fallback to AI processing (or fallback string)
-    output = aiProcess(command, context)
-    print("\nAI Response:", output)
+    output = str(aiProcess(command, context)).strip()
+    logger.info("AI Response: \n%s", output)
     speak(output)
+
+    found_url = _extract_first_url(output)
+    if found_url:
+        LAST_PROVIDED_URL = found_url
 
     if context is None:
         context = []
@@ -392,26 +534,45 @@ def listen_and_respond(context=None):
         try:
             with mic as source:
                 # Recalibrate only after several consecutive failures
-                if failures >= FAILURE_RECALIBRATE_AFTER:
-                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                print("\n")
+                if failures >= CONFIG.failure_recalibrate_after:
+                    recognizer.adjust_for_ambient_noise(
+                        source, duration=CONFIG.ambient_adjust_duration
+                    )
                     failures = 0
-                print("\n--> Sagar listening...")
-                audio = recognizer.listen(source, timeout=LISTEN_TIMEOUT, phrase_time_limit=PHRASE_TIME_LIMIT)
+                logger.info("Sagar listening...")
+                audio = recognizer.listen(
+                    source,
+                    timeout=CONFIG.listen_timeout,
+                    phrase_time_limit=CONFIG.phrase_time_limit,
+                )
                 try:
-                    command = recognizer.recognize_google(audio)
+                    alternatives = _recognize_google_any(recognizer, audio)
+                    if not alternatives:
+                        raise sr.UnknownValueError()
+                    command = max(alternatives, key=lambda s: len(s.split()))
                 except sr.UnknownValueError:
                     # Could not parse audio
-                    print("\nSorry, I didn't catch that.")
+                    logger.info("Sorry, I didn't catch that.")
                     failures += 1
                     continue
                 except sr.RequestError as e:
                     # API/service error (network or service)
-                    print("\nSpeech recognition service error:", e)
+                    logger.error("Speech recognition service error: %s", e)
                     speak("Speech service error. Please check your internet connection.")
                     continue
 
+                print("\n")
                 failures = 0
-                print("\nCommand:", command)
+                if _needs_followup(command) and not _is_quick_command(command):
+                    followup = _listen_followup(recognizer, mic)
+                    if followup:
+                        command = f"{command} {followup}".strip()
+                    if _needs_followup(command):
+                        followup2 = _listen_followup(recognizer, mic)
+                        if followup2:
+                            command = f"{command} {followup2}".strip()
+                logger.info("Command: %s", command)
                 context, exit_to_wake = prossesCommand(command, context)
                 if exit_to_wake:
                     # user said goodbye; return to wake-word mode
@@ -419,14 +580,14 @@ def listen_and_respond(context=None):
 
         except sr.WaitTimeoutError:
             # Nothing said; go back to listening in active mode
-            print("\nListening timed out (no speech detected).")
+            logger.info("Listening timed out (no speech detected).")
             continue
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received. Exiting.\n")
+            logger.info("Keyboard interrupt received. Exiting.")
             speak("Goodbye.\n")
             raise
         except Exception as e:
-            print("Unexpected error in active listening:", e)
+            logger.error("Unexpected error in active listening: %s", e)
             # keep the assistant alive; don't drop to wake-word mode unexpectedly
             continue
 
@@ -499,8 +660,94 @@ def is_wake_word(text: str) -> bool:
     return False
 
 
+def _word_count(text: str) -> int:
+    return len([w for w in text.split() if w.strip(".,!?;:")])
+
+
+def _needs_followup(text: str) -> bool:
+    if not text:
+        return False
+    return _word_count(text) < CONFIG.min_command_words or _ends_with_incomplete_phrase(text)
+
+
+def _ends_with_incomplete_phrase(text: str) -> bool:
+    tail = _normalize_text(text)
+    if not tail:
+        return False
+    if tail.startswith("tell me about") and _word_count(tail) <= 4:
+        return True
+    if tail.endswith(("youtube", "video", "videos", "link", "links", "learning", "learn")):
+        return True
+    words = [w for w in tail.split() if w]
+    if len(words) >= 2:
+        last_word = words[-1]
+        prev_word = words[-2]
+        if prev_word in {"for", "about", "on", "of", "to", "with", "regarding", "concerning"} and len(last_word) <= 3:
+            return True
+    for phrase in (
+        "tell me about",
+        "can you",
+        "could you",
+        "would you",
+        "i want to",
+        "i need",
+        "i would like",
+        "about",
+        "on",
+        "of",
+        "to",
+        "for",
+        "with",
+        "regarding",
+        "concerning",
+    ):
+        if tail.endswith(phrase):
+            return True
+    return False
+
+
+def _is_quick_command(text: str) -> bool:
+    norm = _normalize_text(text)
+    if not norm:
+        return False
+    if norm in {
+        "open google",
+        "open facebook",
+        "open youtube",
+        "open github",
+        "open stack overflow",
+        "open stackoverflow",
+        "open linkedin",
+        "open vscode",
+        "open vs code",
+        "open visual studio code",
+        "close vscode",
+        "close vs code",
+        "close visual studio code",
+    }:
+        return True
+    return norm.startswith("play ") or norm.startswith("search ") or _is_goodbye(norm)
+
+
+def _listen_followup(recognizer: sr.Recognizer, mic: sr.Microphone) -> str:
+    try:
+        with mic as source:
+            audio = recognizer.listen(
+                source,
+                timeout=CONFIG.followup_timeout,
+                phrase_time_limit=CONFIG.followup_phrase_limit,
+            )
+        alternatives = _recognize_google_any(recognizer, audio)
+        if not alternatives:
+            return ""
+        return max(alternatives, key=lambda s: len(s.split()))
+    except Exception:
+        return ""
+
+
 # ---------- Main (wake-word) loop ----------
 def main():
+    print("\n")
     context = None
     recognizer = sr.Recognizer()
     _configure_recognizer(recognizer, mode="wake")
@@ -508,71 +755,84 @@ def main():
     wake_failures = 0
     mic = sr.Microphone()
 
-    print("\nSagar voice assistant starting. Say 'hey sagar' to activate.")
+    logger.info("Sagar voice assistant starting. Say 'hey sagar' to activate.")
     speak("Sagar voice assistant starting. Say 'hey sagar' to activate.")
 
     # Initial ambient calibration to reduce false negatives
     try:
         with sr.Microphone() as source:
-            print("Calibrating microphone...")
-            recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+            logger.info("Calibrating microphone...")
+            recognizer.adjust_for_ambient_noise(source, duration=CONFIG.ambient_adjust_duration)
     except Exception as e:
-        print("Microphone calibration error:", e)
+        logger.error("Microphone calibration error: %s", e)
 
     while True:
-        print("\nRecognizing...")
+        print("\n")
+        logger.info("Recognizing...")
         try:
             with mic as source:
-                print("Listening...")
+                logger.info("Listening...")
                 # Recalibrate occasionally or after consecutive failures
-                if WAKEWORD_RECALIBRATE_EVERY and (wake_checks % WAKEWORD_RECALIBRATE_EVERY == 0):
-                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
-                if wake_failures >= FAILURE_RECALIBRATE_AFTER:
-                    recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_ADJUST_DURATION)
+                if CONFIG.wakeword_recalibrate_every and (
+                    wake_checks % CONFIG.wakeword_recalibrate_every == 0
+                ):
+                    recognizer.adjust_for_ambient_noise(
+                        source, duration=CONFIG.ambient_adjust_duration
+                    )
+                if wake_failures >= CONFIG.wakeword_failure_recalibrate_after:
+                    recognizer.adjust_for_ambient_noise(
+                        source, duration=CONFIG.ambient_adjust_duration
+                    )
                     wake_failures = 0
                 audio = recognizer.listen(
                     source,
-                    timeout=WAKEWORD_TIMEOUT,
-                    phrase_time_limit=WAKEWORD_PHRASE_LIMIT
+                    timeout=CONFIG.wakeword_timeout,
+                    phrase_time_limit=CONFIG.wakeword_phrase_limit,
                 )
                 wake_checks += 1
 
-            alternatives = _recognize_google_any(recognizer, audio)
+            try:
+                alternatives = _recognize_google_any(recognizer, audio)
+            except sr.RequestError as e:
+                logger.error("Speech recognition service error: %s", e)
+                speak("Speech service error. Please check your internet connection.")
+                continue
             if not alternatives:
-                print("Didn't catch that.")
+                logger.info("Didn't catch that.")
                 wake_failures += 1
                 continue
 
             wake_failures = 0
-            heard = alternatives[0]
-            print("\nHeard (wakecheck):", heard)
+            heard = max(alternatives, key=lambda s: len(s.split()))
+            logger.info("Heard (wakecheck): %s", heard)
 
             # GLOBAL EXIT (works even without wake word)
             if any(is_exit_command(alt) for alt in alternatives):
                 speak("Goodbye. Shutting down.")
-                print("Exit command received. Stopping assistant.\n")
+                logger.info("Exit command received. Stopping assistant.")
                 break
 
             if any(is_wake_word(alt) for alt in alternatives):
-                print("\nYes Boss! How can I assist you?")
+                logger.info("Yes Boss! How can I assist you?")
                 speak("Yes boss. How can I assist you?")
                 # Enter active mode; when it returns, we go back to wake-word mode
                 try:
                     listen_and_respond(context=context)
                 except KeyboardInterrupt:
-                    print("Exiting on keyboard interrupt.\n\n")
+                    logger.info("Exiting on keyboard interrupt.\n")
                     break
                 # when listen_and_respond returns, we continue loop and begin wake-word detection again
 
         except sr.WaitTimeoutError:
-            print("\nTimeout! (no wake word detected)\n")
+            logger.info("Timeout! (no wake word detected)")
             continue
         except KeyboardInterrupt:
-            print("\nKeyboard interrupt received. Stopping assistant.\n")
-            speak("Goodbye.\n")
+            print("\n")
+            logger.info("Keyboard interrupt received. Stopping assistant.\n\n")
+            speak("Goodbye.")
             break
         except Exception as e:
-            print("\nError in main loop:\n", e)
+            logger.error("Error in main loop: %s", e)
             time.sleep(0.5)
             continue
 
